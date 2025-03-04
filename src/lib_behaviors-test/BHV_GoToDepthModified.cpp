@@ -278,6 +278,16 @@ string BHV_GoToDepthModified::expandMacros(string sdata)
 }
 
 
+// Procedure: onIdleState()
+
+void BHV_GoToDepthModified::onIdleState() 
+{
+  
+ 
+}
+
+
+
 
 
   

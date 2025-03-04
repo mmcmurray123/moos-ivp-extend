@@ -21,8 +21,19 @@
 /* <http://www.gnu.org/licenses/>.                               */
 /*****************************************************************/
  
+
+
+
 #ifndef BHV_WAYPOINT3D_HEADER
 #define BHV_WAYPOINT3D_HEADER
+
+//////////////////////////
+// for gotodepth stuff ///
+#include <vector> ////////
+//////////////////////////
+
+
+
 
 #include <string>
 #include "IvPBehavior.h"
@@ -49,7 +60,7 @@ public:
 protected:
   bool         updateInfoIn();
   bool         setNextWaypoint();
-  IvPFunction* buildOF(std::string);
+  IvPFunction* buildOF();
   
   void         checkLeadConditions();
   void         postStatusReport();
@@ -116,7 +127,7 @@ protected: // intermediate or object global variables.
 
   double    m_course_pct;
   double    m_speed_pct;
-
+  double    m_depth_pct;
   double    m_osx_prev;
   double    m_osy_prev;
 
@@ -133,6 +144,63 @@ protected: // intermediate or object global variables.
   
   int       m_prev_cycle_index;
   int       m_prev_waypt_index;
+
+
+  // Constant Depth Stuff
+
+
+  protected:
+  // bool         updateInfoIn();
+
+ protected: // Configuration variables
+  double      m_desired_depth;
+  double      m_peakwidth;
+  double      m_basewidth;
+  double      m_summitdelta;
+  std::string m_depth_mismatch_var;
+
+ protected: // State variables
+  double      m_osd;
+
+
+
+  // Go To Depth Stuff
+
+  protected:
+  bool setNextLevelDepth();
+  bool incrementLevelDepth();
+  
+
+protected:  // configuration parameters
+  int       m_repeat;
+  // double    m_basewidth;
+  // double    m_peakwidth;
+  double    m_arrival_delta;
+
+  std::string         m_arrival_flag;
+  std::vector<double> m_level_depths;
+  std::vector<double> m_level_times;
+
+protected:  // local state variables
+  unsigned int  m_curr_index;
+  unsigned int  m_arrivals;
+
+  double    m_prior_vehicle_depth;
+  double    m_plateau_start_time;
+  bool      m_plateau_mode;
+  bool      m_first_iteration;
+
+
+
+
+
+// flags for whether going to depth, holding depth, or going to x-y waypoint
+protected:
+  bool to_next_x_y;
+  bool to_next_depth;
+  bool register_wypt_hit;
+
+
   
 
 };

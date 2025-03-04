@@ -1,3 +1,5 @@
+// Based on the original file:
+
 /*****************************************************************/
 /*    NAME: Michael Benjamin                                     */
 /*    ORGN: Dept of Mechanical Engineering, MIT, Cambridge MA    */
@@ -21,6 +23,9 @@
 /* <http://www.gnu.org/licenses/>.                               */
 /*****************************************************************/
 
+
+// BHV_Waypoint3D made by Matthew McMurray, BYU, Feb 2025
+
 #include <cmath> 
 #include <cstdlib>
 #include <iostream>
@@ -43,6 +48,13 @@
 #include "VarDataPairUtils.h"
 #include "IO_Utilities.h"
 
+///////////////////////
+// constant depth stuff
+#include <fstream> 
+///////////////////////
+
+
+
 using namespace std;
 
 //-----------------------------------------------------------
@@ -51,9 +63,12 @@ using namespace std;
 BHV_Waypoint3D::BHV_Waypoint3D(IvPDomain gdomain) : 
   IvPBehavior(gdomain)
 {
+
+ // 3D waypoint domain (x,y,z,speed)
+  m_domain     = subDomain(m_domain, "course,speed,depth");
+
   // First set variables at the superclass level
   m_descriptor = "BHV_Waypoint3D";  
-  m_domain     = subDomain(m_domain, "course,speed");
 
   // Set behavior configuration variables
   m_cruise_speed     = 0;  // meters/second
@@ -88,6 +103,8 @@ BHV_Waypoint3D::BHV_Waypoint3D(IvPDomain gdomain) :
   m_completed  = false; 
   m_perpetual  = false;
 
+
+  // split 50/50
   m_course_pct = 50;
   m_speed_pct  = 50;
 
@@ -126,6 +143,40 @@ BHV_Waypoint3D::BHV_Waypoint3D(IvPDomain gdomain) :
   m_markpt.set_vertex_size(4);
 
   m_prevpt.set_label("prev_pt");
+
+
+
+// Depth stuff
+
+
+// (from go to depth)
+// configuration parameters
+m_repeat        = 0;
+m_basewidth     = 5;
+m_peakwidth     = 0;
+m_arrival_delta = 1;  // meters
+
+// local state variables
+m_curr_index          = 0;
+m_prior_vehicle_depth = 0;
+m_plateau_mode        = false;
+m_plateau_start_time  = 0;
+m_arrivals            = 0;
+m_first_iteration     = true;
+
+addInfoVars("NAV_DEPTH");
+
+
+// (from constant depth)
+
+m_desired_depth = 0;
+m_summitdelta   = 50;
+m_osd           = 0;
+m_duration      = 0;
+
+
+register_wypt_hit = false;
+
 }
 
 //-----------------------------------------------------------
@@ -440,6 +491,83 @@ bool BHV_Waypoint3D::setParam(string param, string param_val)
 
   else if(param == "visual_hints")  
     return(m_hints.setHints(param_val));
+   else if((param == "depth") && isNumber(param_val)) { ///// Constant Depth Params
+      m_desired_depth = vclip_min(dval, 0);
+      return(true);
+    }  
+    else if((param == "summitdelta") && isNumber(param_val)) {
+      m_summitdelta = vclip(dval, 0, 100);
+      return(true);
+    }
+  
+    else if((param == "depth_mismatch_var") && !strContainsWhite(param_val)) {
+      m_depth_mismatch_var = param_val;
+      return(true);
+    }
+    if(param == "depths") { /////////// Go To Depth stuff
+      vector<string> out_vector = parseString(param_val, ':');
+      int outsize = out_vector.size();
+      for(int i=0; i<outsize; i++) {
+        vector<string> in_vector = parseString(out_vector[i], ',');
+        int in_size = in_vector.size();
+        double idepth = 0;
+        double itime  = 0;
+        if((in_size<1) || (in_size > 2))
+    return(false);
+  
+        // Determine the chosen depth
+        if(isNumber(in_vector[0]) == false)
+    return(false);
+        idepth = atof(in_vector[0].c_str());
+        
+        // Determine the chosen time - if not spec, ok, then zero
+        if(in_size == 2) {
+    if(isNumber(in_vector[1]) == false)
+      return(false);
+    itime = atof(in_vector[1].c_str());	
+        }
+        else
+    itime = 0;
+        
+        // Check for semantically unallowed param_values
+        if((idepth < 0) || (itime < 0))
+    return(false);
+        
+        m_level_depths.push_back(idepth);
+        m_level_times.push_back(itime);
+      }
+      return(true);
+    }
+    else if(param == "repeat") {
+      int ival = atoi(param_val.c_str());
+      if((ival < 0) || (!isNumber(param_val)))
+        return(false);
+      m_repeat = ival;
+      return(true);
+    }
+    else if((param == "arrival_delta") || 
+      (param == "capture_delta")) {
+      double dval = atof(param_val.c_str());
+      if((dval < 0) || (!isNumber(param_val)))
+        return(false);
+      m_arrival_delta = dval;
+      return(true);
+    }
+    else if((param == "arrival_flag") ||
+      (param == "capture_flag")) {
+      m_arrival_flag = "GTD_" + param_val;
+      return(true);
+    }
+    else if((param == "peakwidth") && isNumber(param_val)) {
+      m_peakwidth = vclip_min(dval, 0);
+      return(true);
+    }
+    else if((param == "basewidth") && isNumber(param_val)) {
+      m_basewidth = vclip_min(dval, 0);
+      
+      return(true);
+    }
+    
 
   return(false);
 }
@@ -501,93 +629,142 @@ BehaviorReport BHV_Waypoint3D::onRunState(string input)
 
 IvPFunction *BHV_Waypoint3D::onRunState() 
 {
-  m_waypoint_engine.setPerpetual(m_perpetual);
 
-  // Set m_osx, m_osy, m_osv, osh
-  if(!updateInfoIn()) {
-    postMessage("VIEW_POINT", m_nextpt.get_spec("active=false"), "wpt");
-    return(0);
+  if(register_wypt_hit){
+    postMessage("REGISTERING", "WE ARE REGISTERING!!!!!!!");
   }
-  updateOdoDistance();
-  checkLeadConditions();
+  else{
 
-  // Note the waypoint prior to possibly incrementing the waypoint
-  double this_x = m_waypoint_engine.getPointX();
-  double this_y = m_waypoint_engine.getPointY();
-  int    this_i = m_waypoint_engine.getCurrIndex();
-  if(!m_prevpt.valid())
-    m_prevpt.set_vertex(m_osx, m_osy);
-
-  // Possibly increment the waypoint
-  // Set m_nextpt, m_trackpt
-  bool next_point = setNextWaypoint();
-    
-  // Update things if the waypoint was indeed incremented
-  double next_x = m_waypoint_engine.getPointX();
-  double next_y = m_waypoint_engine.getPointY();
-  bool post_wpt_flags = false;
-  if((next_x != this_x) || (next_y != this_y))
-    post_wpt_flags = true;
-  if(m_wpt_flag_on_start && !m_wpt_flag_published)
-    post_wpt_flags = true;
-  if(m_completed)
-    post_wpt_flags = true;
-  if(m_waypt_hit)
-    post_wpt_flags = true;
-
-  if(post_wpt_flags) {
-    m_prevpt.set_vertex(this_x, this_y);
-    if(m_eager_prev_index_flag)
-      m_prev_waypt_index = this_i;
-    postFlags(m_wpt_flags);
-    m_wpt_flag_published = true;
+    postMessage("REGISTERING", "NOT REGISTERING :( :( :(");
   }
 
-  // We want to report the updated cycle info regardless of the 
-  // above result. Even if the next_point is false and there are
-  // no more points, this means the cyindex is probably incremented.
-  if(m_var_cyindex != "silent") {
-    int waypt_cycles  = m_waypoint_engine.getCycleCount();
-    if(waypt_cycles != m_prev_cycle_index) {
-      postMessage((m_var_cyindex + m_var_suffix), waypt_cycles);
-      m_prev_cycle_index = waypt_cycles;
-    }
-  }
-
-  // Only publish these reports if we have another point to go.
-  if(next_point) {
-    postStatusReport();
-    if(!m_eager_prev_index_flag)
-      m_prev_waypt_index = m_waypoint_engine.getCurrIndex();
-    postViewableSegList();
-    //postMessage("VIEW_POINT", m_prevpt.get_spec("active=true"), "prevpt");
-    postMessage("VIEW_POINT", m_nextpt.get_spec("active=true"), "wpt");
-    double dist = hypot((m_nextpt.x() - m_trackpt.x()), 
-			(m_nextpt.y() - m_trackpt.y()));
-    // If the trackpoint and next waypoint differ by more than five
-    // meters then post a visual cue for the track point.
-    if(dist > 5)
-      postMessage("VIEW_POINT", m_trackpt.get_spec(), "trk");
-    else
-      postMessage("VIEW_POINT", m_trackpt.get_spec_inactive(), "trk");
-    
-  }
-  // Otherwise "erase" the next waypoint marker
-  else {
-    postMessage("VIEW_POINT", m_nextpt.get_spec_inactive(), "wpt");
-    return(0);
-  }
   
-  if(m_var_dist_to_prev != "")
-    postMessage(m_var_dist_to_prev, m_waypoint_engine.distToPrevWpt(m_osx, m_osy));
-  if(m_var_dist_to_next != "")
-    postMessage(m_var_dist_to_next, m_waypoint_engine.distToNextWpt(m_osx, m_osy));
 
-  IvPFunction *ipf = buildOF(m_ipf_type);
+
+    m_waypoint_engine.setPerpetual(m_perpetual);
+    
+
+    ///////////////// do x y waypoint stuff /////////////////////
+
+
+    // Set m_osx, m_osy, m_osv, osh
+    if(!updateInfoIn()) {
+      postMessage("VIEW_POINT", m_nextpt.get_spec("active=false"), "wpt");
+      return(0);
+    }
+    updateOdoDistance();
+    checkLeadConditions();
+  
+    // Note the waypoint prior to possibly incrementing the waypoint
+    double this_x = m_waypoint_engine.getPointX();
+    double this_y = m_waypoint_engine.getPointY();
+    int    this_i = m_waypoint_engine.getCurrIndex();
+    if(!m_prevpt.valid())
+      m_prevpt.set_vertex(m_osx, m_osy);
+  
+    // Possibly increment the waypoint
+    // Set m_nextpt, m_trackpt
+    bool next_point = setNextWaypoint();
+      
+    // Update things if the waypoint was indeed incremented
+    double next_x = m_waypoint_engine.getPointX();
+    double next_y = m_waypoint_engine.getPointY();
+    bool post_wpt_flags = false;
+    if((next_x != this_x) || (next_y != this_y))
+      post_wpt_flags = true;
+    if(m_wpt_flag_on_start && !m_wpt_flag_published)
+      post_wpt_flags = true;
+    if(m_completed)
+      post_wpt_flags = true;
+    if(m_waypt_hit)
+      post_wpt_flags = true;
+  
+    if(post_wpt_flags) {
+      m_prevpt.set_vertex(this_x, this_y);
+      if(m_eager_prev_index_flag)
+        m_prev_waypt_index = this_i;
+      postFlags(m_wpt_flags);
+      m_wpt_flag_published = true;
+    
+      // if you raised wpt_flags, then set register_wypt_hit to false so you go to the next depth
+
+     
+    }
+  
+    // We want to report the updated cycle info regardless of the 
+    // above result. Even if the next_point is false and there are
+    // no more points, this means the cyindex is probably incremented.
+    if(m_var_cyindex != "silent") {
+      int waypt_cycles  = m_waypoint_engine.getCycleCount();
+      if(waypt_cycles != m_prev_cycle_index) {
+        postMessage((m_var_cyindex + m_var_suffix), waypt_cycles);
+        m_prev_cycle_index = waypt_cycles;
+      }
+    }
+  
+    // Only publish these reports if we have another point to go.
+    if(next_point) {
+      postStatusReport();
+      if(!m_eager_prev_index_flag)
+        m_prev_waypt_index = m_waypoint_engine.getCurrIndex();
+      postViewableSegList();
+      //postMessage("VIEW_POINT", m_prevpt.get_spec("active=true"), "prevpt");
+      postMessage("VIEW_POINT", m_nextpt.get_spec("active=true"), "wpt");
+      double dist = hypot((m_nextpt.x() - m_trackpt.x()), 
+        (m_nextpt.y() - m_trackpt.y()));
+      // If the trackpoint and next waypoint differ by more than five
+      // meters then post a visual cue for the track point.
+      if(dist > 5)
+        postMessage("VIEW_POINT", m_trackpt.get_spec(), "trk");
+      else
+        postMessage("VIEW_POINT", m_trackpt.get_spec_inactive(), "trk");
+      
+    }
+    // Otherwise "erase" the next waypoint marker
+    else {
+      postMessage("VIEW_POINT", m_nextpt.get_spec_inactive(), "wpt");
+      return(0);
+    }
+    
+    if(m_var_dist_to_prev != "")
+      postMessage(m_var_dist_to_prev, m_waypoint_engine.distToPrevWpt(m_osx, m_osy));
+    if(m_var_dist_to_next != "")
+      postMessage(m_var_dist_to_next, m_waypoint_engine.distToNextWpt(m_osx, m_osy));
+  
+    
+
+    /////////////////////////// do depth stuff ////////////////////////
+
+    if(!m_domain.hasDomain("depth")) {
+      postEMessage("No 'depth' variable in the helm domain");
+      return(0);
+    }
+  
+    bool valid_depth_level = setNextLevelDepth();
+   
+    // Once the target depth level has been calculated for the first
+    // time, declare first_iteration to be false.
+    m_first_iteration = false;
+  
+  
+    // If no next-depth-level return NULL - it may or may not be an
+    // error condition. That is determined in setNextDepthLevel();
+    if(!valid_depth_level)
+      return(0);
+    
+  
+
+
+  IvPFunction *ipf = buildOF();
   if(ipf)
     ipf->setPWT(m_priority_wt);
 
   return(ipf);
+
+
+  // postEMessage("Not Doing Anything! Something is wrong...");
+  // return(0);
+
 }
 
 //-----------------------------------------------------------
@@ -611,11 +788,27 @@ void BHV_Waypoint3D::onIdleState()
 
 bool BHV_Waypoint3D::updateInfoIn()
 {
-  bool ok1, ok2, ok3, ok4;
+
+  bool ok0, ok1, ok2, ok3, ok4;
+  m_osd = getBufferDoubleVal("NAV_DEPTH", ok0);
   m_osx = getBufferDoubleVal("NAV_X",       ok1);
   m_osy = getBufferDoubleVal("NAV_Y",       ok2);
   m_osh = getBufferDoubleVal("NAV_HEADING", ok3);
   m_osv = getBufferDoubleVal("NAV_SPEED",   ok4);
+  
+
+  if(!ok0) {
+    postWMessage("No ownship DEPTH info in info_buffer.");  
+    return(false);
+  }
+
+  double delta = m_osd - m_level_depths[m_curr_index];
+  if(delta < 0)
+    delta *= -1; 
+
+  if(m_depth_mismatch_var != "")
+    postMessage(m_depth_mismatch_var, delta);
+  
 
   // Must get ownship position from InfoBuffer
   if(!ok1 || !ok2) {
@@ -642,6 +835,14 @@ bool BHV_Waypoint3D::updateInfoIn()
     postWMessage("No ownship speed info in info_buffer");
 
   return(true);
+
+
+  
+
+  return(false);
+
+
+  
 }
 
 
@@ -661,9 +862,13 @@ bool BHV_Waypoint3D::setNextWaypoint()
 
   cout << "feedback_msg = " << feedback_msg << endl;
   
-  if((feedback_msg == "completed") || (feedback_msg == "cycled") ||
-     (feedback_msg == "advanced"))
-    m_waypt_hit = true;
+  if(((feedback_msg == "completed") || (feedback_msg == "cycled") ||
+     (feedback_msg == "advanced") ) && register_wypt_hit){
+      m_waypt_hit = true;
+      register_wypt_hit = false;
+
+     }
+   
   
   if(feedback_msg == "empty_seglist")
     return(false);
@@ -759,7 +964,7 @@ bool BHV_Waypoint3D::setNextWaypoint()
 //-----------------------------------------------------------
 // Procedure: buildOF()
 
-IvPFunction *BHV_Waypoint3D::buildOF(string method) 
+IvPFunction *BHV_Waypoint3D::buildOF()
 {
   IvPFunction *ipf = 0;
  
@@ -767,73 +972,58 @@ IvPFunction *BHV_Waypoint3D::buildOF(string method)
   if((m_use_alt_speed) && (m_cruise_speed_alt >= 0))
     cruise_speed = m_cruise_speed_alt;
   
-  if((method == "roc") || (method == "rate_of_closure")) {
-    bool ok = true;
-    AOF_Waypoint aof_wpt(m_domain);
-    ok = ok && aof_wpt.setParam("desired_speed", cruise_speed);
-    ok = ok && aof_wpt.setParam("osx", m_osx);
-    ok = ok && aof_wpt.setParam("osy", m_osy);
-    ok = ok && aof_wpt.setParam("ptx", m_trackpt.x());
-    ok = ok && aof_wpt.setParam("pty", m_trackpt.y());
-    ok = ok && aof_wpt.initialize();
-    
-    if(ok) {
-      OF_Reflector reflector(&aof_wpt);
-      reflector.create(600, 500);
-      //reflector.setParam("uniform_piece", "discrete @ course:3,speed:3");
-      //reflector.create();
-      //string info = reflector.getUniformPieceStr();
-      //postMessage("WAYPT_UPIECE", info);
-      ipf = reflector.extractIvPFunction();
-    }
-  }    
-  else { // if (method == "zaic","zaic_spd")
 
-    IvPFunction *spd_ipf = 0;
+  IvPFunction *spd_ipf = 0;
 
-    if(method == "zaic_spd") {
-      ZAIC_SPD spd_zaic(m_domain, "speed");
-      //spd_zaic.setMedSpeed(m_cruise_speed);
-      //spd_zaic.setLowSpeed(0.1);
-      //spd_zaic.setHghSpeed(m_cruise_speed+0.4);
-      //spd_zaic.setLowSpeedUtil(70);
-      //spd_zaic.setHghSpeedUtil(20);
-      //spd_zaic.setMaxSpdUtil(20);
+  ZAIC_PEAK spd_zaic(m_domain, "speed");
+  double peak_width = m_cruise_speed / 2;
+  spd_zaic.setParams(m_cruise_speed, peak_width, 1.6, 20, 0, 100);
+  //    spd_zaic.setParams(m_cruise_speed, 1, 1.6, 20, 0, 100);               
+  spd_ipf = spd_zaic.extractIvPFunction();
+  if(!spd_ipf){
+    postWMessage("Failure on the SPD ZAIC via ZAIC_PEAK utility");
+  }
+    // }    
+    
+  double rel_ang_to_trk_pt = relAng(m_osx, m_osy, m_trackpt.x(), m_trackpt.y());
 
-      spd_zaic.setParams(m_cruise_speed, 0.1, m_cruise_speed+0.4, 70, 20);
-      spd_ipf = spd_zaic.extractIvPFunction();
-      if(!spd_ipf)
-	postWMessage("Failure on the SPD ZAIC via ZAIC_SPD utility");
-    }
-    else {
-      ZAIC_PEAK spd_zaic(m_domain, "speed");
-      double peak_width = m_cruise_speed / 2;
-      spd_zaic.setParams(m_cruise_speed, peak_width, 1.6, 20, 0, 100);
-      //    spd_zaic.setParams(m_cruise_speed, 1, 1.6, 20, 0, 100);               
-      spd_ipf = spd_zaic.extractIvPFunction();
-      if(!spd_ipf)
-	postWMessage("Failure on the SPD ZAIC via ZAIC_PEAK utility");
-    }    
-    
-    double rel_ang_to_trk_pt = relAng(m_osx, m_osy, m_trackpt.x(), m_trackpt.y());
+  ZAIC_PEAK crs_zaic(m_domain, "course");
+  crs_zaic.setValueWrap(true);
+  crs_zaic.setParams(rel_ang_to_trk_pt, 0, 180, 50, 0, 100);
+  
+  int ix = crs_zaic.addComponent();
+  crs_zaic.setParams(m_osh, 30, 180, 5, 0, 20, ix);
+  
+  IvPFunction *crs_ipf = crs_zaic.extractIvPFunction(false);
 
-    ZAIC_PEAK crs_zaic(m_domain, "course");
-    crs_zaic.setValueWrap(true);
-    crs_zaic.setParams(rel_ang_to_trk_pt, 0, 180, 50, 0, 100);
-    
-    int ix = crs_zaic.addComponent();
-    crs_zaic.setParams(m_osh, 30, 180, 5, 0, 20, ix);
-    
-    IvPFunction *crs_ipf = crs_zaic.extractIvPFunction(false);
+  if(!crs_ipf) 
+    postWMessage("Failure on the CRS ZAIC");
 
-    if(!crs_ipf) 
-      postWMessage("Failure on the CRS ZAIC");
     
-    OF_Coupler coupler;
-    ipf = coupler.couple(crs_ipf, spd_ipf, m_course_pct, m_speed_pct);
-    if(!ipf)
-      postWMessage("Failure on the CRS_SPD COUPLER");
-  }    
+
+  ZAIC_PEAK zaic(m_domain, "depth");
+  zaic.setSummit(m_level_depths[m_curr_index]);
+  zaic.setBaseWidth(m_basewidth);
+  zaic.setPeakWidth(m_peakwidth);
+  zaic.setSummitDelta(m_summitdelta);
+  
+  IvPFunction *depth_ipf = zaic.extractIvPFunction();
+  if(depth_ipf)
+    depth_ipf->setPWT(m_priority_wt);
+  else 
+    postEMessage("Unable to generate constant-depth IvP function");
+
+  string zaic_warnings = zaic.getWarnings();
+  if(zaic_warnings != "")
+    postWMessage(zaic_warnings);
+    
+  OF_Coupler coupler;
+  IvPFunction *ivp_spd_crs = coupler.couple(crs_ipf, spd_ipf, m_course_pct, m_speed_pct);
+
+  ipf = coupler.couple(ivp_spd_crs, depth_ipf, 50.0,50.0);
+  if(!ipf)
+    postWMessage("Failure on the CRS_SPD COUPLER");
+  // }    
   return(ipf);
 }
 
@@ -1187,6 +1377,26 @@ string BHV_Waypoint3D::expandMacros(string sdata)
 		      m_waypoint_engine.getCurrIndex());
   sdata = macroExpand(sdata, "WPTS", m_waypoint_engine.size());
 
+
+
+
+
+
+
+  // depth stuff
+  sdata = macroExpand(sdata, "DESIRED_CONST_DEPTH", m_level_depths[m_curr_index]);
+
+
+
+
+  sdata = macroExpand(sdata, "CURR_IDX", m_curr_index);
+
+  if(m_curr_index == 0)
+    sdata = macroExpand(sdata, "DEPTH_LAST_ACHIEVED", 0);
+  else
+    sdata = macroExpand(sdata, "DEPTH_LAST_ACHIEVED", m_level_depths[m_curr_index - 1]);
+  
+
   return(sdata);
 }
 
@@ -1201,5 +1411,102 @@ string BHV_Waypoint3D::getReverseStr() const
     return("reverse");
   
   return("normal");
+}
+
+
+
+//-----------------------------------------------------------
+// Procedure: setNextDepthLevel
+//      Note: Objective is to incmrement m_curr_index if warranted.
+//   Returns: false if at the end or an error.
+//            If an error, will also post an EMessage.
+
+bool BHV_Waypoint3D::setNextLevelDepth()
+{
+  bool ok;
+  double vehicle_depth = getBufferDoubleVal("NAV_DEPTH", ok);
+  
+  // Must get ownship depth from InfoBuffer
+  if(!ok) {
+    postEMessage("No ownship Depth info in Helm info_buffer.");
+    return(false);
+  }
+
+  double curr_time = getBufferCurrTime();
+
+  bool new_level = false;
+
+  if(m_plateau_mode) {
+    double elapsed_time = curr_time - m_plateau_start_time;
+    if(!register_wypt_hit/*elapsed_time >= m_level_times[m_curr_index]*/) {
+      m_plateau_mode = false;
+      bool incremented = incrementLevelDepth();
+      if(!incremented)
+	return(false);
+    }
+    else
+      return(true);
+  }
+
+  double delta = vehicle_depth - m_level_depths[m_curr_index];
+  if(delta < 0)
+    delta *= -1;
+  
+  // If within arrival_delta meters of target depth, declare arrival
+  if(delta <= m_arrival_delta)
+    new_level = true;
+
+  // If we crossed the target depth going down, we declare arrival
+  if((vehicle_depth >= m_level_depths[m_curr_index]) &&
+     (m_level_depths[m_curr_index] >= m_prior_vehicle_depth) &&
+     (!m_first_iteration))
+    new_level = true;
+
+  // If we crossed the target depth going up, we declare arrival
+  if((vehicle_depth <= m_level_depths[m_curr_index]) &&
+     (m_level_depths[m_curr_index] <= m_prior_vehicle_depth) &&
+     (!m_first_iteration))
+    new_level = true;
+  
+  if(new_level) {
+    m_arrivals++;
+    if(m_arrival_flag != "")
+      postMessage(m_arrival_flag, m_arrivals);
+    m_plateau_mode = true;
+    register_wypt_hit = true;
+    m_plateau_start_time = curr_time;
+
+  }
+  
+  // Set the prior depth to curr depth for access on next iteration
+  m_prior_vehicle_depth = vehicle_depth;
+
+  return(true);
+}
+
+//-----------------------------------------------------------
+// Procedure: incrementLevelDepth
+
+bool BHV_Waypoint3D::incrementLevelDepth()
+{
+  m_curr_index++;
+  if((m_curr_index >= m_level_depths.size()) && (m_repeat==0)) {
+    setComplete();
+    if(m_perpetual) {
+      m_curr_index = 0;
+      m_first_iteration = true;
+      m_arrivals = 0;
+    }
+    return(false);
+  }
+  
+  // If last depth level but repeats are indicated
+  if(m_curr_index >= m_level_depths.size()) {
+    m_repeat--;
+    m_curr_index = 0;
+  }
+
+  postMessage("LEVEL_DEPTH", m_level_depths[m_curr_index]);
+  return(true);
 }
 

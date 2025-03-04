@@ -21,13 +21,6 @@
 /* <http://www.gnu.org/licenses/>.                               */
 /*****************************************************************/
  
-
-/*
-
-This was modified to maintain the depth that 
-it is at on the idle state
-
-*/
 #ifndef BHV_GOTODEPTHMODIFIED_HEADER
 #define BHV_GOTODEPTHMODIFIED_HEADER
 
@@ -39,9 +32,9 @@ class BHV_GoToDepthModified : public IvPBehavior {
 public:
   BHV_GoToDepthModified(IvPDomain);
   ~BHV_GoToDepthModified() {}
-
-  void         onIdleState() {updateInfoIn();}
+  
   IvPFunction* onRunState();
+  void         onIdleState();
   bool         setParam(std::string, std::string);
   std::string    expandMacros(std::string);
 
